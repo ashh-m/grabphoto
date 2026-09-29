@@ -1,0 +1,851 @@
+// ==UserScript==
+// @name         Photo Grabber + Citations
+// @namespace    https://local.photo-grabber
+// @version      0.2.0
+// @description  List photos on a page, pick some, and download them with a citation file. Extra handling for Google Images, Flickr, Pinterest and Reddit.
+// @match        *://*/*
+// @noframes
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
+// @connect      *
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  /* ------------------------------------------------------------------ *
+   *  Helpers
+   * ------------------------------------------------------------------ */
+  const EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif', 'image/svg+xml': 'svg' };
+  const hostIs = (h, d) => h === d || h.endsWith('.' + d);
+  const text = (el, max = 240) => (el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const stripHtml = (h) => (new DOMParser().parseFromString(h, 'text/html').body.textContent || '').replace(/\s+/g, ' ').trim();
+  const safe = (s) => s.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').replace(/^\.+/, '').trim();
+  const unj = (s) => { try { return JSON.parse('"' + s + '"'); } catch { return s; } };
+  // Pinterest's auto-generated descriptions start with "This may contain:"
+  const cleanTitle = (t) => {
+    t = (t || '').replace(/^this may contain:\s*/i, '').replace(/\s+/g, ' ').trim();
+    return t ? t[0].toUpperCase() + t.slice(1) : t;
+  };
+  // Shorten at a word boundary instead of mid-word
+  const trunc = (s, n) => (s.length <= n ? s : s.slice(0, n).replace(/\s+\S*$/, '')).replace(/[\s.,;:-]+$/, '');
+  const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } };
+  const baseName = (u) => {
+    if (u.startsWith('data:')) return 'image';
+    try { return decodeURIComponent(u.split('?')[0].split('/').pop() || '').replace(/\.[^.]+$/, ''); } catch { return 'image'; }
+  };
+
+  const gmGet = (url, type = 'text') =>
+    new Promise((resolve, reject) =>
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: type, timeout: 30000,
+        headers: { Referer: location.href },
+        onload: (r) => (r.status >= 200 && r.status < 300 ? resolve(r.response) : reject(new Error('HTTP ' + r.status))),
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timeout')),
+      })
+    );
+
+  // Fetch a web page and parse it (cached), so we can read the source page's details
+  const pageCache = new Map();
+  function fetchPage(url) {
+    if (!pageCache.has(url)) {
+      pageCache.set(url, new Promise((resolve, reject) =>
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 20000,
+          onload: (r) => {
+            if (r.status < 200 || r.status >= 300) return reject(new Error('HTTP ' + r.status));
+            resolve({ html: r.responseText, doc: new DOMParser().parseFromString(r.responseText, 'text/html'), finalUrl: r.finalUrl || url });
+          },
+          onerror: () => reject(new Error('network error')),
+          ontimeout: () => reject(new Error('timeout')),
+        })
+      ));
+    }
+    return pageCache.get(url);
+  }
+
+  // Walk the page including open shadow roots (Reddit and other modern sites use them)
+  function* walkDeep(root) {
+    for (const el of root.querySelectorAll('*')) {
+      yield el;
+      if (el.shadowRoot) yield* walkDeep(el.shadowRoot);
+    }
+  }
+  const up = (n) => n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+  function closestDeep(el, sel) {
+    for (let n = el; n; n = up(n)) if (n.matches && n.matches(sel)) return n;
+    return null;
+  }
+
+  function dataToBlob(u) {
+    const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(u);
+    const bin = m[2] ? atob(m[3]) : decodeURIComponent(m[3]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: m[1] || 'image/jpeg' });
+  }
+
+  // Try the best-quality URL first, then fall back to smaller ones
+  async function fetchBlob(it) {
+    if (it.blobP) return it.blobP;
+    it.blobP = (async () => {
+      let err;
+      for (const u of [it.url, ...(it.fallbacks || [])]) {
+        try {
+          const b = u.startsWith('data:') ? dataToBlob(u) : await gmGet(u, 'blob');
+          if (b.size > 0 && !/^text\//.test(b.type)) { it.finalUrl = u; return b; }
+        } catch (e) { err = e; }
+      }
+      throw err || new Error('download failed');
+    })();
+    return it.blobP;
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Collect images, with site-specific upgrades to full size
+   * ------------------------------------------------------------------ */
+  const isGoogleImages = () =>
+    /(^|\.)google\./.test(location.hostname) && (/[?&](tbm=isch|udm=2)(&|$)/.test(location.search) || location.pathname.startsWith('/imghp'));
+
+  function bestFromSrcset(s) {
+    if (!s) return '';
+    let best = '', score = 0;
+    s.split(/,\s+(?=\S)/).forEach((part) => {
+      const [u, d] = part.trim().split(/\s+/);
+      if (!u) return;
+      const n = d ? parseFloat(d) : 1;
+      if (n >= score) { score = n; best = u; }
+    });
+    return best;
+  }
+
+  function enhance(it) {
+    it.hint = {};
+    let u;
+    try { u = new URL(it.url); } catch { return; }
+    const a = it.el && closestDeep(it.el, 'a[href]');
+    const href = a ? a.href : '';
+    it.hint.title = (it.el && it.el.alt) || '';
+
+    if (isGoogleImages()) {
+      if (/\/imgres\?/.test(href)) {
+        const p = new URL(href).searchParams;
+        const full = p.get('imgurl');
+        if (full && /^https?:/.test(full)) { it.thumb = it.url; it.fallbacks = [it.url]; it.url = full; }
+        it.hint.sourceUrl = p.get('imgrefurl') || '';
+      } else if (href && !/(^|\.)google\./.test(hostOf(href))) {
+        it.hint.sourceUrl = href;
+      }
+      if (!it.hint.sourceUrl && !it.thumb && (it.url.startsWith('data:') || hostIs(u.hostname, 'gstatic.com'))) it.hint.thumbOnly = true;
+    }
+
+    if (hostIs(location.hostname, 'pinterest.com') || hostIs(u.hostname, 'pinimg.com')) {
+      const re = /pinimg\.com\/(?:\d+x\d*(?:_[A-Za-z0-9]+)?)\//;
+      if (re.test(it.url)) {
+        it.thumb = it.url;
+        it.fallbacks = [it.url.replace(re, 'pinimg.com/736x/'), it.url];
+        it.url = it.url.replace(re, 'pinimg.com/originals/');
+      }
+      const pin = it.el && closestDeep(it.el, 'a[href*="/pin/"]');
+      it.hint.via = (pin && pin.href) || (location.pathname.startsWith('/pin/') ? location.href : '');
+    }
+
+    if (u.hostname === 'preview.redd.it') {
+      it.thumb = it.url; it.fallbacks = [it.url];
+      it.url = 'https://i.redd.it' + u.pathname;
+    }
+
+    if (hostIs(u.hostname, 'staticflickr.com')) {
+      const m = /^(https?:\/\/[^?#]*\/(\d+)_[0-9a-f]+)(?:_[a-z0-9]{1,2})?\.(jpe?g|png|gif)$/i.exec(it.url.split('?')[0]);
+      if (m) {
+        it.hint.flickrId = m[2];
+        it.thumb = it.url;
+        it.fallbacks = [`${m[1]}_c.${m[3]}`, it.url];
+        it.url = `${m[1]}_b.${m[3]}`;
+      }
+      const link = it.el && closestDeep(it.el, 'a[href*="/photos/"]');
+      if (link && /\/photos\/[^/]+\/\d+/.test(link.href)) it.hint.sourceUrl = link.href;
+    }
+  }
+
+  function collect() {
+    const seen = new Map();
+    const add = (raw, el) => {
+      if (!raw) return;
+      let url;
+      if (raw.startsWith('data:image/')) {
+        if (raw.length < 1500) return; // skip tiny placeholders and icons
+        url = raw;
+      } else {
+        try { url = new URL(raw, location.href).href; } catch { return; }
+        if (!/^https?:/.test(url)) return;
+      }
+      const it = { url, el, sel: false };
+      enhance(it);
+      if (!seen.has(it.url)) seen.set(it.url, it);
+    };
+    for (const el of walkDeep(document)) {
+      if (el.tagName === 'IMG') {
+        const d = el.dataset;
+        add(bestFromSrcset(el.srcset) || bestFromSrcset(d.srcset) || d.src || d.original || d.lazySrc || el.currentSrc || el.src, el);
+      } else {
+        const bg = getComputedStyle(el).backgroundImage;
+        if (bg && bg !== 'none') for (const m of bg.matchAll(/url\((['"]?)(.*?)\1\)/g)) add(m[2], el);
+      }
+    }
+    document.querySelectorAll('meta[property="og:image"],link[rel="image_src"]').forEach((m) => add(m.content || m.href, null));
+    return [...seen.values()];
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Reading details from a page
+   * ------------------------------------------------------------------ */
+  const nameOf = (v) => (!v ? '' : Array.isArray(v) ? v.map(nameOf).filter(Boolean).join(', ') : typeof v === 'string' ? v : v.name || '');
+
+  function ldFrom(doc) {
+    const out = [];
+    const walk = (o) => {
+      if (Array.isArray(o)) return o.forEach(walk);
+      if (!o || typeof o !== 'object') return;
+      out.push(o);
+      if (o['@graph']) walk(o['@graph']);
+    };
+    doc.querySelectorAll('script[type="application/ld+json"]').forEach((s) => { try { walk(JSON.parse(s.textContent)); } catch { /* ignore */ } });
+    return out;
+  }
+
+  function ccName(u) {
+    const m = /creativecommons\.org\/(licenses|publicdomain)\/([a-z-]+)\/?([\d.]+)?/i.exec(u || '');
+    if (!m) return '';
+    if (m[1] === 'publicdomain') return m[2].toLowerCase() === 'zero' ? 'CC0 1.0' : 'Public Domain Mark';
+    return `CC ${m[2].toUpperCase()}${m[3] ? ' ' + m[3] : ''}`;
+  }
+
+  // Fill in whatever is still blank from a page's meta tags and structured data
+  function mineDoc(doc, M) {
+    const mc = (...names) => {
+      for (const n of names) {
+        const e = doc.querySelector(`meta[name="${n}" i],meta[property="${n}" i]`);
+        const v = e && e.getAttribute('content');
+        if (v && v.trim()) return v.trim();
+      }
+      return '';
+    };
+    const ld = ldFrom(doc);
+    const notUrl = (v) => (/^https?:/i.test(v) ? '' : v);
+    if (!M.creator) {
+      const author = nameOf((ld.find((o) => o.author) || {}).author) || notUrl(mc('author', 'article:author', 'dc.creator', 'citation_author'));
+      if (author) { M.creator = author; M.creatorFrom = "the page's author tag"; M.weakCreator = true; }
+    }
+    M.date ||= mc('article:published_time', 'datePublished', 'dc.date', 'date') || (ld.find((o) => o.datePublished) || {}).datePublished || '';
+    M.title ||= mc('og:title', 'twitter:title') || doc.title || '';
+    M.site ||= mc('og:site_name', 'application-name') || hostOf(M.sourceUrl);
+    const l = doc.querySelector('link[rel~="license" i],a[rel~="license" i]');
+    if (l && !M.license && !M.licenseUrl) {
+      try {
+        M.licenseUrl = new URL(l.getAttribute('href'), M.sourceUrl).href;
+        M.license = ccName(M.licenseUrl);
+        M.licenseNote = 'shown on the page; may not cover every photo on it';
+      } catch { /* ignore */ }
+    }
+  }
+
+  // Credit text sitting next to the image on the current page
+  function nearImage(it, M) {
+    if (!it.el) return;
+    M.caption = text(closestDeep(it.el, 'figure')?.querySelector('figcaption'));
+    let node = it.el.parentElement;
+    for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+      if (node.querySelectorAll('img').length > 1) break;
+      const c = node.querySelector('[class*="credit" i],[class*="attribution" i],[class*="photographer" i],[itemprop="author"],[itemprop="creator"],[itemprop="copyrightHolder"]');
+      if (c) {
+        M.credit = text(c, 160);
+        const who = M.credit.replace(/^(photos?|images?|credits?|photographs?|source)s?\s*(by|:)?\s*/i, '');
+        if (who && !M.creator) { M.creator = who; M.creatorFrom = 'the credit text next to the image'; }
+        break;
+      }
+    }
+    M.title ||= it.el.title || '';
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Site handlers
+   * ------------------------------------------------------------------ */
+  async function doWikimedia(u, M) {
+    M.noMine = true;
+    const segs = decodeURIComponent(u.pathname).split('/').filter(Boolean);
+    let i = 2;
+    if (segs[0] !== 'wikipedia') return;
+    if (segs[i] === 'thumb') i++;
+    const name = segs[i + 2];
+    if (!name) return;
+    const api = segs[1] === 'commons' ? 'https://commons.wikimedia.org' : `https://${segs[1]}.wikipedia.org`;
+    const j = JSON.parse(await gmGet(`${api}/w/api.php?action=query&format=json&prop=imageinfo&iiprop=extmetadata%7Curl&titles=${encodeURIComponent('File:' + name)}`));
+    const info = Object.values(j.query?.pages || {})[0]?.imageinfo?.[0];
+    if (!info) { M.notes.push('Not found in the Wikimedia API.'); return; }
+    const e = info.extmetadata || {};
+    const v = (k) => (e[k]?.value ? stripHtml(e[k].value) : '');
+    M.creator = v('Artist'); M.creatorFrom = 'Wikimedia API';
+    M.license = v('LicenseShortName'); M.licenseUrl = e.LicenseUrl?.value || '';
+    M.attribution = v('Attribution');
+    M.title = v('ObjectName') || name.replace(/_/g, ' ').replace(/\.[^.]+$/, '');
+    M.date = v('DateTimeOriginal') || v('DateTime');
+    M.sourceUrl = info.descriptionurl || location.href;
+    M.site = 'Wikimedia Commons';
+  }
+
+  async function doFlickr(it, M) {
+    let src = it.hint.sourceUrl || (it.hint.flickrId ? `https://www.flickr.com/photo.gne?id=${it.hint.flickrId}` : '');
+    if (!src && /flickr\.com\/photos\/[^/]+\/\d+/.test(location.href)) src = location.href;
+    if (!src) { M.warn = true; M.notes.push('Could not work out which Flickr photo this is.'); return; }
+    M.sourceUrl = src;
+    const { html, doc, finalUrl } = await fetchPage(src);
+    M.sourceUrl = finalUrl.split('?')[0];
+    M.site = 'Flickr';
+    const t = ((doc.querySelector('meta[property="og:title"]') || {}).content || doc.title || '').replace(/\s*\|\s*Flickr\s*$/i, '').trim();
+    if (t) M.title = t;
+    const owner = text(doc.querySelector('a.owner-name'), 80) || unj((/"ownername":"([^"]+)"/.exec(html) || [])[1] || '');
+    const alias = (/flickr\.com\/photos\/([^/]+)\/\d+/.exec(M.sourceUrl) || [])[1];
+    if (owner) { M.creator = owner; M.creatorFrom = 'the Flickr photo page'; }
+    else if (alias) { M.creator = decodeURIComponent(alias); M.creatorFrom = 'the Flickr username in the URL'; }
+    const ts = (/"datePosted":"?(\d{9,10})"?/.exec(html) || [])[1];
+    if (ts) M.date = new Date(+ts * 1000).toISOString().slice(0, 10);
+  }
+
+  async function doPinterest(it, M) {
+    const pin = it.hint.via;
+    let found = '', pinner = '', pinTitle = '', created = '';
+    if (pin) {
+      M.via = pin; M.viaName = 'Pinterest';
+      try {
+        const { html, doc } = await fetchPage(pin);
+        const meta = (n) => (doc.querySelector(`meta[property="${n}"],meta[name="${n}"]`) || {}).content || '';
+        found = unj(meta('og:see_also') || (/"link":"(https?:[^"]+)"/.exec(html) || [])[1] || '');
+        pinner = (/pinterest\.[a-z.]+\/([^/?#]+)/i.exec(meta('pinterestapp:pinner')) || [])[1]
+          || unj((/"pinner":\{[\s\S]{0,800}?"username":"([^"]+)"/.exec(html) || [])[1] || '');
+        pinTitle = unj((/"grid_title":"([^"]+)"/.exec(html) || [])[1] || '') || meta('og:title');
+        created = (/"created_at":"([^"]+)"/.exec(html) || [])[1] || '';
+      } catch (e) { M.notes.push(`Could not open the pin page (${e.message}).`); }
+    }
+    pinTitle = pinTitle.replace(/\s*\|\s*Pinterest\s*$/i, '').trim();
+    if (pinTitle && !/^pinterest$/i.test(pinTitle) && (!M.title || /^this may contain/i.test(M.title))) M.title = pinTitle;
+    if (found && !/(^|\.)pinterest\./.test(hostOf(found))) {
+      M.sourceUrl = found;
+    } else {
+      M.sourceUrl = pin; M.site = 'Pinterest'; M.via = ''; M.noMine = true; M.warn = true; M.pinOnly = !!pin;
+      if (pinner) { M.creator = decodeURIComponent(pinner); M.creatorFrom = 'the Pinterest user who saved the pin'; M.weakCreator = true; }
+      const d = new Date(created);
+      if (created && !isNaN(d)) M.date = d.toISOString().slice(0, 10);
+      if (pin) M.notes.push('Pinterest did not show an original website, so this cites the pin itself, credited to the person who saved it. If the pin links to an original site, cite that page instead. Otherwise a reverse image search (Google Lens) can help you find the original.');
+    }
+  }
+
+  async function doReddit(it, M) {
+    M.site = 'Reddit'; M.noMine = true;
+    const post = it.el && closestDeep(it.el, 'shreddit-post,div.thing');
+    let permalink = '', author = '', title = '', ts = '';
+    if (post && post.tagName === 'SHREDDIT-POST') {
+      permalink = post.getAttribute('permalink') || ''; author = post.getAttribute('author') || '';
+      title = post.getAttribute('post-title') || ''; ts = post.getAttribute('created-timestamp') || '';
+    } else if (post) {
+      permalink = post.getAttribute('data-permalink') || ''; author = post.getAttribute('data-author') || '';
+      title = text(post.querySelector('a.title'));
+      const t = post.getAttribute('data-timestamp');
+      ts = t ? new Date(+t).toISOString() : '';
+    }
+    if (!permalink) {
+      const a = it.el && closestDeep(it.el, 'a[href*="/comments/"]');
+      if (a) permalink = a.href; else if (location.pathname.includes('/comments/')) permalink = location.pathname;
+    }
+    try { permalink = new URL(permalink, location.origin).pathname; } catch { permalink = ''; }
+    if (permalink && (!author || !title)) {
+      try {
+        const j = JSON.parse(await gmGet(`https://www.reddit.com${permalink.replace(/\/$/, '')}.json?raw_json=1`));
+        const d = j[0].data.children[0].data;
+        author ||= d.author; title ||= d.title; ts ||= new Date(d.created_utc * 1000).toISOString();
+      } catch (e) { M.notes.push(`Could not load post details (${e.message}).`); }
+    }
+    if (title) M.title = title;
+    if (author && author !== '[deleted]') { M.creator = 'u/' + author; M.creatorFrom = 'the Reddit poster'; M.weakCreator = true; }
+    if (ts) M.date = ts.slice(0, 10);
+    if (permalink) M.sourceUrl = 'https://www.reddit.com' + permalink;
+    else { M.sourceUrl = location.href; M.warn = true; M.notes.push('Could not find the Reddit post for this image, so this cites the current page.'); }
+  }
+
+  function doGoogle(it, M) {
+    // Google fills in a thumbnail's link when you hover or press on it, so trigger that once and read it
+    if (!it.hint.sourceUrl && it.el) {
+      const a = closestDeep(it.el, 'a[href]');
+      if (a) {
+        ['mouseover', 'mousedown'].forEach((t) => a.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window })));
+        try {
+          if (/\/imgres\?/.test(a.href)) {
+            const p = new URL(a.href).searchParams;
+            it.hint.sourceUrl = p.get('imgrefurl') || '';
+            const full = p.get('imgurl');
+            if (full && /^https?:/.test(full) && !it.thumb) { it.thumb = it.url; it.fallbacks = [it.url]; it.url = full; }
+          } else if (a.href && !/(^|\.)google\./.test(hostOf(a.href))) {
+            it.hint.sourceUrl = a.href;
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    if (it.hint.sourceUrl) { M.sourceUrl = it.hint.sourceUrl; return; }
+    M.sourceUrl = ''; M.site = 'Google Images'; M.noMine = true; M.warn = true;
+    if (it.hint.thumbOnly) M.notes.push("This is only Google's small thumbnail, so the saved image is low resolution.");
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Resolve citation details for one image (cached per item)
+   * ------------------------------------------------------------------ */
+  function resolve(it) {
+    return (it.metaP ||= (async () => {
+      let u;
+      try { u = new URL(it.url); } catch { u = { hostname: '' }; }
+      const onH = (d) => hostIs(location.hostname, d) || hostIs(u.hostname, d);
+      const M = {
+        title: it.hint.title || '', creator: '', date: '', license: '', licenseUrl: '', licenseNote: '', attribution: '',
+        site: '', sourceUrl: '', via: '', viaName: '', caption: '', credit: '', imageUrl: it.url,
+        creatorFrom: '', weakCreator: false, warn: false, noMine: false, pinOnly: false, notes: [],
+      };
+      try {
+        if (hostIs(u.hostname, 'wikimedia.org') || hostIs(u.hostname, 'wikipedia.org')) await doWikimedia(u, M);
+        else if (onH('flickr.com') || onH('staticflickr.com')) await doFlickr(it, M);
+        else if (isGoogleImages()) doGoogle(it, M);
+        else if (onH('pinterest.com') || onH('pinimg.com')) await doPinterest(it, M);
+        else if (onH('reddit.com') || onH('redd.it')) await doReddit(it, M);
+      } catch (e) { M.warn = true; M.notes.push(`Site lookup failed (${e.message}).`); }
+
+      if (!M.noMine) {
+        let doc = null;
+        if (M.sourceUrl && M.sourceUrl !== location.href) {
+          try { doc = (await fetchPage(M.sourceUrl)).doc; } catch (e) { M.notes.push(`Could not open the source page (${e.message}).`); }
+        } else {
+          M.sourceUrl = location.href; doc = document; nearImage(it, M);
+        }
+        if (doc) mineDoc(doc, M);
+      }
+      M.site ||= hostOf(M.sourceUrl);
+      M.title = cleanTitle(M.title || baseName(it.url));
+      return M;
+    })());
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Citation output
+   * ------------------------------------------------------------------ */
+  const fmtDate = (d) => { const t = new Date(d); return isNaN(t) ? '' : t.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
+
+  function citation(M, style) {
+    const t = new Date(M.date);
+    const year = isNaN(t) ? 'n.d.' : String(t.getFullYear());
+    const acc = new Date().toISOString().slice(0, 10);
+    const url = (M.sourceUrl || '').split('#')[0];
+    if (style === 'apa') {
+      const who = M.creator ? `${M.creator}. (${year}). ${M.title} [Photograph].` : `${M.title} [Photograph]. (${year}).`;
+      return `${who} ${M.site}.${url ? ' ' + url : ''}`;
+    }
+    if (style === 'mla') {
+      const d = fmtDate(M.date);
+      return `${M.creator ? M.creator + '. ' : ''}"${M.title}." ${M.site}${d ? ', ' + d : ''}${url ? ', ' + url : ''}. Accessed ${fmtDate(acc)}.`;
+    }
+    const via = M.via ? ` Found via ${M.viaName || 'another site'} (${M.via.split('#')[0]}).` : '';
+    const lic = M.license || M.licenseUrl ? ` License: ${[M.license, M.licenseUrl].filter(Boolean).join(' ')}.` : '';
+    return `"${M.title}"${M.creator ? ' by ' + M.creator : ''}. Source: ${M.site}${url ? ', ' + url : ' (original page not identified)'}.${via}${lic} Accessed ${acc}.`;
+  }
+
+  // Things the person should double-check, in plain words
+  function issues(M) {
+    const out = [];
+    if (!M.sourceUrl) {
+      out.push(M.site === 'Google Images'
+        ? "No source page was found. On Google, click the photo, use the site name or Visit link to open the original page, then add that page's address to the citation."
+        : "No source page was found. Add the address of the page the photo came from.");
+    } else if (!M.creator && !M.pinOnly) {
+      out.push('No photographer or author was found. Look for a photo credit on the source page. If there is none, leave the creator out.');
+    }
+    if (M.creator && M.weakCreator && !M.pinOnly) out.push(`"${M.creator}" came from ${M.creatorFrom} and may not be the photographer. Check the source page.`);
+    if (M.licenseNote) out.push(`The page mentions ${M.license || M.licenseUrl}, but that may not cover this photo.`);
+    M.notes.forEach((n) => out.push(n));
+    return out;
+  }
+
+  function sidecar(M, style) {
+    const iss = issues(M);
+    return (
+      `COPY THIS INTO YOUR WORKS CITED\n${citation(M, style)}\n` +
+      (M.attribution ? `\nREQUIRED ATTRIBUTION (from Wikimedia)\n${M.attribution}\n` : '') +
+      (iss.length ? `\nCHECK BEFORE YOU HAND IT IN\n${iss.map((i) => '- ' + i).join('\n')}\n` : '')
+    );
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Saving files
+   * ------------------------------------------------------------------ */
+  function save(blob, name) {
+    return new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const done = () => { setTimeout(() => URL.revokeObjectURL(url), 10000); resolve(); };
+      const fallback = () => {
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click(); a.remove();
+        done();
+      };
+      try { GM_download({ url, name, saveAs: false, onload: done, onerror: fallback }); } catch { fallback(); }
+    });
+  }
+  const extOf = (blob, url) => EXT[blob.type] || (/\.(jpe?g|png|webp|gif|avif|svg)(\?|$)/i.exec(url) || [])[1]?.toLowerCase().replace('jpeg', 'jpg') || 'jpg';
+
+
+  /* ------------------------------------------------------------------ *
+   *  Minimal ZIP writer (no compression; photos are already compressed)
+   * ------------------------------------------------------------------ */
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+
+  // files: [{ name: 'folder/file.jpg', data: Uint8Array }]
+  function makeZip(files) {
+    const enc = new TextEncoder();
+    const local = [], central = [];
+    let offset = 0;
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    for (const f of files) {
+      const nameB = enc.encode(f.name);
+      const crc = crc32(f.data);
+      const size = f.data.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); // 0x0800 = UTF-8 names
+      lh.setUint16(8, 0, true); lh.setUint16(10, dosTime, true); lh.setUint16(12, dosDate, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+      lh.setUint16(26, nameB.length, true); lh.setUint16(28, 0, true);
+      local.push(lh.buffer, nameB, f.data);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true);
+      ch.setUint16(10, 0, true); ch.setUint16(12, dosTime, true); ch.setUint16(14, dosDate, true);
+      ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+      ch.setUint16(28, nameB.length, true); ch.setUint32(42, offset, true);
+      central.push(ch.buffer, nameB);
+      offset += 30 + nameB.length + size;
+    }
+    const cdSize = central.reduce((n, b) => n + b.byteLength, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true);
+    end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+    return new Blob([...local, ...central, end.buffer], { type: 'application/zip' });
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  UI (Shadow DOM so page CSS can't interfere)
+   * ------------------------------------------------------------------ */
+  const host = document.createElement('div');
+  host.style.cssText = 'all:initial;position:fixed;z-index:2147483647;top:0;left:0;width:0;height:0;';
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = `
+  <style>
+    *{box-sizing:border-box;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+    #fab{position:fixed;right:16px;bottom:16px;width:42px;height:42px;border-radius:50%;border:0;background:#1b2a3a;color:#fff;font-size:18px;cursor:pointer;opacity:.5;box-shadow:0 2px 10px #0006}
+    #fab:hover{opacity:1}
+    #ov{position:fixed;inset:0;background:#0e1319f5;color:#e6ebf0;display:flex;flex-direction:column}
+    #ov[hidden],#fab[hidden]{display:none}
+    .bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;padding:10px 16px;border-bottom:1px solid #26313d;background:#141b23}
+    .bar strong{font-size:15px;margin-right:4px}
+    .bar label{display:flex;gap:6px;align-items:center;color:#9fb0c0}
+    .bar button,.bar select{background:#1f2a36;color:#e6ebf0;border:1px solid #33424f;border-radius:6px;padding:5px 10px;cursor:pointer}
+    .bar button:hover{background:#28374a}
+    .bar button.primary{background:#3b82c4;border-color:#3b82c4;color:#fff;font-weight:600}
+    .bar button.primary:disabled{opacity:.4;cursor:default}
+    .sp{flex:1}
+    #grid{flex:1;min-height:0;overflow-y:auto;padding:16px;display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));grid-auto-rows:max-content;gap:12px;align-content:start}
+    .card{position:relative;display:flex;flex-direction:column;background:#182029;border:2px solid transparent;border-radius:8px;overflow:hidden;cursor:pointer}
+    .card[hidden]{display:none}
+    .card.sel{border-color:#5aa9f0}
+    .card input{position:absolute;top:8px;left:8px;width:18px;height:18px;z-index:1}
+    .th{flex:none;height:150px;background:#0a0e13;display:flex;align-items:center;justify-content:center}
+    .th img{max-width:100%;max-height:100%;object-fit:contain}
+    .info{flex:none;padding:8px 10px;display:flex;flex-direction:column;gap:3px;min-height:56px}
+    .dim{color:#8394a5;font-size:11px}
+    .meta{font-size:12px;word-break:break-word}
+    .warn{color:#f0c060}
+    #status{padding:8px 16px;border-top:1px solid #26313d;color:#9fb0c0;min-height:34px}
+  </style>
+  <button id="fab" title="Photo Grabber (Alt+Shift+P). Alt+click any photo to select it.">📷</button>
+  <div id="ov" hidden>
+    <div class="bar">
+      <strong>Photo Grabber</strong><span id="count" class="dim"></span>
+      <label>Min size <input id="min" type="range" min="0" max="1200" step="50" value="150"><span id="minv">150px</span></label>
+      <label>Save as <select id="mode"><option value="zip">One ZIP file</option><option value="files">Separate files</option></select></label>
+      <label>Citation style <select id="style"><option value="attr">Simple credit</option><option value="apa">APA</option><option value="mla">MLA</option></select></label>
+      <button id="all">Select visible</button><button id="none">Clear</button><button id="more">Load more</button>
+      <span class="sp"></span>
+      <button id="copy">Copy citations</button>
+      <button id="dl" class="primary" disabled>Download</button>
+      <button id="x" title="Close (Esc)">Close</button>
+    </div>
+    <div id="grid"></div>
+    <div id="status"></div>
+  </div>`;
+  document.documentElement.appendChild(host);
+
+  const $ = (s) => root.querySelector(s);
+  const ov = $('#ov'), grid = $('#grid'), statusEl = $('#status');
+  let items = [];
+  const setStatus = (t) => { statusEl.textContent = t; };
+
+  function updateCount() {
+    const n = items.filter((i) => i.sel).length;
+    $('#count').textContent = `${items.length} images found, ${n} selected`;
+    $('#dl').textContent = `Download${n ? ' (' + n + ')' : ''}`;
+    $('#dl').disabled = !n;
+  }
+
+  function applyFilter() {
+    const min = +$('#min').value;
+    $('#minv').textContent = min + 'px';
+    items.forEach((i) => { i.card.hidden = i.broken || (i.w != null && Math.max(i.w, i.h) < min); });
+  }
+
+  function setSelected(it, on) {
+    it.sel = on;
+    it.cb.checked = on;
+    it.card.classList.toggle('sel', on);
+    updateCount();
+    if (!on) return;
+    it.metaEl.textContent = 'Looking up the source…';
+    resolve(it).then((M) => {
+      const flag = M.warn || M.weakCreator || !M.creator;
+      it.metaEl.textContent = `${flag ? '⚠ ' : ''}${M.creator || 'Creator unknown'}, ${M.site}`;
+      it.metaEl.classList.toggle('warn', flag);
+      it.metaEl.title = `Creator from: ${M.creatorFrom || 'not found'}\n${M.notes.join('\n')}`;
+    }).catch((e) => { it.metaEl.textContent = 'Lookup failed: ' + e.message; });
+  }
+
+  let known = new Set();
+  let loading = false, exhausted = false, emptyTries = 0;
+
+  function addCard(it) {
+    const shown = it.thumb || it.url;
+    const card = document.createElement('label');
+    card.className = 'card';
+    card.innerHTML = '<input type="checkbox"><div class="th"><img loading="lazy" alt=""></div><div class="info"><span class="dim dimtxt">Loading…</span><span class="meta">Select to look up the source</span></div>';
+    it.card = card;
+    it.cb = card.querySelector('input');
+    it.metaEl = card.querySelector('.meta');
+    const img = card.querySelector('img');
+    img.onload = () => {
+      it.w = img.naturalWidth; it.h = img.naturalHeight;
+      const where = shown.startsWith('data:') ? 'inline thumbnail' : hostOf(shown);
+      card.querySelector('.dimtxt').textContent = it.thumb ? `${where} (full size fetched on download)` : `${it.w}×${it.h} · ${where}`;
+      applyFilter();
+    };
+    img.onerror = () => { it.broken = true; applyFilter(); };
+    img.src = shown;
+    it.cb.addEventListener('change', () => setSelected(it, it.cb.checked));
+    grid.appendChild(card);
+  }
+
+  // Add any photos that have appeared on the page since we last looked
+  function refreshItems() {
+    let added = 0;
+    for (const it of collect()) {
+      if (known.has(it.url)) continue;
+      known.add(it.url);
+      items.push(it);
+      addCard(it);
+      added++;
+    }
+    if (added) { updateCount(); applyFilter(); }
+    return added;
+  }
+
+  // Scroll the real page to the bottom so it loads more photos
+  function scrollPageToEnd() {
+    const se = document.scrollingElement || document.documentElement;
+    se.scrollTo({ top: se.scrollHeight });
+    // some sites scroll an inner container instead of the window
+    let best = null;
+    for (const el of document.body.querySelectorAll('*')) {
+      if (el.scrollHeight > el.clientHeight + 200 && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) {
+        if (!best || el.clientHeight * el.clientWidth > best.clientHeight * best.clientWidth) best = el;
+      }
+    }
+    if (best && best !== se && best !== document.body) best.scrollTop = best.scrollHeight;
+  }
+
+  // Click a "Show more results" style button if the page has one
+  function clickShowMore() {
+    const re = /^(show more( results)?|see more( results)?|load more( results)?|more results)$/i;
+    for (const el of walkDeep(document)) {
+      if (!/^(BUTTON|A)$/.test(el.tagName) && el.getAttribute('role') !== 'button') continue;
+      if (el.offsetParent !== null && re.test(text(el, 40))) { el.click(); return true; }
+    }
+    return false;
+  }
+
+  async function loadMore(manual) {
+    if (loading || ov.hidden) return;
+    if (manual) { exhausted = false; emptyTries = 0; }
+    if (exhausted) return;
+    loading = true;
+    $('#more').disabled = true;
+    setStatus(`Loading more photos from the page… (${items.length} so far)`);
+    scrollPageToEnd();
+    clickShowMore();
+    await new Promise((r) => setTimeout(r, 1600));
+    const added = refreshItems();
+    loading = false;
+    $('#more').disabled = false;
+    if (added) {
+      emptyTries = 0;
+      setStatus(`Found ${added} more photos (${items.length} total). Keep scrolling for more.`);
+    } else if (++emptyTries >= 2) {
+      exhausted = true;
+      setStatus(`No new photos are loading, so this may be the end of the page (${items.length} total). Click "Load more" to try again.`);
+    }
+    // Keep going if nothing new arrived yet, or the panel is too short to scroll
+    const tooShort = grid.scrollHeight <= grid.clientHeight + 200;
+    if (!exhausted && !ov.hidden && items.length < 2000 && (!added || tooShort)) loadMore();
+  }
+
+  function openPanel(preselect) {
+    items = []; known = new Set(); exhausted = false; emptyTries = 0; loading = false;
+    grid.innerHTML = '';
+    refreshItems();
+    if (ov.hidden) {
+      prevOverflow = document.documentElement.style.overflow;
+      document.documentElement.style.overflow = 'hidden';
+    }
+    ov.hidden = false;
+    $('#fab').hidden = true;
+    setStatus('Scroll down to load more photos from the page. ' + (isGoogleImages()
+      ? 'Click a result so its side panel opens, then Alt+click the large preview image for the best source link.'
+      : 'Alt+click any photo on the page to open this panel with it selected.'));
+    updateCount();
+    applyFilter();
+    if (preselect) {
+      const hit = items.find((i) => i.el === preselect);
+      if (hit) { setSelected(hit, true); hit.card.scrollIntoView({ block: 'center' }); }
+    }
+    setTimeout(() => { if (grid.scrollHeight <= grid.clientHeight + 200) loadMore(); }, 300);
+  }
+
+  let prevOverflow = '';
+  function closePanel() {
+    if (!ov.hidden) document.documentElement.style.overflow = prevOverflow;
+    ov.hidden = true;
+    $('#fab').hidden = false;
+  }
+  const togglePanel = () => (ov.hidden ? openPanel() : closePanel());
+
+  async function downloadSelected() {
+    const sel = items.filter((i) => i.sel);
+    if (!sel.length) return;
+    const style = $('#style').value;
+    const asZip = $('#mode').value === 'zip';
+    const date = new Date().toISOString().slice(0, 10);
+    const folder = `photos-${location.hostname.replace(/^www\./, '')}-${date}`;
+    const enc = new TextEncoder();
+    const used = new Set(), failed = [], all = [], zipFiles = [];
+    $('#dl').disabled = true;
+    for (const [n, it] of sel.entries()) {
+      setStatus(`${asZip ? 'Fetching' : 'Downloading'} ${n + 1} of ${sel.length}…`);
+      try {
+        const M0 = await resolve(it);
+        const blob = await fetchBlob(it);
+        const M = { ...M0, notes: [...M0.notes], imageUrl: it.finalUrl.startsWith('data:') ? `(inline thumbnail from ${M0.sourceUrl})` : it.finalUrl };
+        if (it.finalUrl !== it.url) M.notes.push('The full-size image could not be downloaded, so this is the smaller version shown on the page.');
+        const base = trunc(safe(M.title), 80) || 'photo';
+        let name = base, k = 2;
+        while (used.has(name)) name = `${base}-${k++}`;
+        used.add(name);
+        const imgName = `${name}.${extOf(blob, it.finalUrl)}`;
+        const txt = sidecar(M, style);
+        if (asZip) {
+          zipFiles.push({ name: `${folder}/${imgName}`, data: new Uint8Array(await blob.arrayBuffer()) });
+          zipFiles.push({ name: `${folder}/${name}.txt`, data: enc.encode(txt) });
+        } else {
+          await save(blob, imgName);
+          await save(new Blob([txt], { type: 'text/plain' }), `${name}.txt`);
+        }
+        all.push({ file: imgName, citation: citation(M, style), issues: issues(M) });
+      } catch (e) { failed.push(`${baseName(it.url)} (${e.message})`); }
+    }
+    if (all.length && (asZip || sel.length > 1)) {
+      const flagged = all.filter((a) => a.issues.length);
+      const combined =
+        `WORKS CITED (${$('#style').selectedOptions[0].text})\n\n` +
+        all.map((a) => `${a.citation}\n[File: ${a.file}]`).join('\n\n') + '\n' +
+        (flagged.length
+          ? `\nCHECK BEFORE YOU HAND IT IN\n\n` + flagged.map((a) => `${a.file}\n${a.issues.map((i) => '  - ' + i).join('\n')}`).join('\n\n') + '\n'
+          : '');
+      if (asZip) zipFiles.push({ name: `${folder}/citations.txt`, data: enc.encode(combined) });
+      else await save(new Blob([combined], { type: 'text/plain' }), `citations-${location.hostname}-${date}.txt`);
+    }
+    if (asZip && zipFiles.length) {
+      setStatus('Building the ZIP…');
+      await save(makeZip(zipFiles), `${folder}.zip`);
+    }
+    const needCheck = all.filter((a) => a.issues.length).length;
+    setStatus(`Saved ${all.length} of ${sel.length}${asZip && all.length ? ' in one ZIP file' : ''}.` +
+      (needCheck ? ` ${needCheck} need a check, listed at the bottom of citations.txt.` : '') +
+      (failed.length ? ' Failed: ' + failed.join('; ') : ''));
+    updateCount();
+  }
+
+  async function copyCitations() {
+    const sel = items.filter((i) => i.sel);
+    if (!sel.length) return setStatus('Select at least one photo first.');
+    const style = $('#style').value;
+    const out = [];
+    for (const it of sel) { try { out.push(citation(await resolve(it), style)); } catch { /* skip */ } }
+    const t = out.join('\n\n');
+    try { GM_setClipboard(t, 'text'); } catch { await navigator.clipboard.writeText(t); }
+    setStatus(`Copied ${out.length} citation${out.length === 1 ? '' : 's'}.`);
+  }
+
+  $('#fab').onclick = togglePanel;
+  $('#x').onclick = closePanel;
+  $('#min').oninput = applyFilter;
+  $('#all').onclick = () => items.forEach((i) => !i.card.hidden && setSelected(i, true));
+  $('#none').onclick = () => items.forEach((i) => setSelected(i, false));
+  $('#dl').onclick = downloadSelected;
+  $('#more').onclick = () => loadMore(true);
+  grid.addEventListener('scroll', () => {
+    if (grid.scrollTop + grid.clientHeight > grid.scrollHeight - 800) loadMore();
+  });
+  $('#copy').onclick = copyCitations;
+
+  document.addEventListener('keydown', (e) => {
+    if (e.altKey && e.shiftKey && e.code === 'KeyP') { e.preventDefault(); togglePanel(); }
+    else if (e.key === 'Escape' && !ov.hidden) closePanel();
+  }, true);
+
+  // Alt+click a photo on the page to open the panel with it selected
+  document.addEventListener('click', (e) => {
+    if (!e.altKey) return;
+    const t = e.composedPath()[0];
+    if (!(t instanceof HTMLImageElement)) return;
+    e.preventDefault(); e.stopPropagation();
+    openPanel(t);
+  }, true);
+
+  try { GM_registerMenuCommand('Open Photo Grabber', togglePanel); } catch { /* not available */ }
+})();
