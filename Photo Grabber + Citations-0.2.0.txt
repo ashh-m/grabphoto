@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Photo Grabber + Citations
 // @namespace    https://local.photo-grabber
-// @version      0.2.0
+// @version      0.3.1
 // @description  List photos on a page, pick some, and download them with a citation file. Extra handling for Google Images, Flickr, Pinterest and Reddit.
 // @match        *://*/*
 // @noframes
@@ -19,6 +19,9 @@
    *  Helpers
    * ------------------------------------------------------------------ */
   const EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif', 'image/avif': 'avif', 'image/svg+xml': 'svg' };
+  const REQ_TIMEOUT_MS = 20000;
+  const IMG_TIMEOUT_MS = 12000;
+  const DL_CONCURRENCY = 3;
   const hostIs = (h, d) => h === d || h.endsWith('.' + d);
   const text = (el, max = 240) => (el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, max);
   const stripHtml = (h) => (new DOMParser().parseFromString(h, 'text/html').body.textContent || '').replace(/\s+/g, ' ').trim();
@@ -37,14 +40,19 @@
     try { return decodeURIComponent(u.split('?')[0].split('/').pop() || '').replace(/\.[^.]+$/, ''); } catch { return 'image'; }
   };
 
-  const gmGet = (url, type = 'text') =>
+  const gmErr = (prefix, r, url) =>
+    `${prefix}${r?.error ? `: ${r.error}` : ''}${r?.status ? ` (HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''})` : ''} for ${url}`;
+
+  const gmGet = (url, type = 'text', timeoutMs = REQ_TIMEOUT_MS) =>
     new Promise((resolve, reject) =>
       GM_xmlhttpRequest({
-        method: 'GET', url, responseType: type, timeout: 30000,
+        method: 'GET', url, responseType: type, timeout: timeoutMs,
         headers: { Referer: location.href },
-        onload: (r) => (r.status >= 200 && r.status < 300 ? resolve(r.response) : reject(new Error('HTTP ' + r.status))),
-        onerror: () => reject(new Error('network error')),
-        ontimeout: () => reject(new Error('timeout')),
+        onload: (r) => (r.status >= 200 && r.status < 300
+          ? resolve(r.response)
+          : reject(new Error(`HTTP ${r.status}${r.statusText ? ' ' + r.statusText : ''} for ${url}`))),
+        onerror: (r) => reject(new Error(gmErr('Network error', r, url))),
+        ontimeout: () => reject(new Error(`Timeout after ${timeoutMs}ms for ${url}`)),
       })
     );
 
@@ -54,13 +62,13 @@
     if (!pageCache.has(url)) {
       pageCache.set(url, new Promise((resolve, reject) =>
         GM_xmlhttpRequest({
-          method: 'GET', url, timeout: 20000,
+          method: 'GET', url, timeout: REQ_TIMEOUT_MS,
           onload: (r) => {
             if (r.status < 200 || r.status >= 300) return reject(new Error('HTTP ' + r.status));
             resolve({ html: r.responseText, doc: new DOMParser().parseFromString(r.responseText, 'text/html'), finalUrl: r.finalUrl || url });
           },
-          onerror: () => reject(new Error('network error')),
-          ontimeout: () => reject(new Error('timeout')),
+          onerror: (r) => reject(new Error(gmErr('Network error', r, url))),
+          ontimeout: () => reject(new Error(`Timeout after ${REQ_TIMEOUT_MS}ms for ${url}`)),
         })
       ));
     }
@@ -92,14 +100,23 @@
   async function fetchBlob(it) {
     if (it.blobP) return it.blobP;
     it.blobP = (async () => {
-      let err;
-      for (const u of [it.url, ...(it.fallbacks || [])]) {
+      const tried = new Set();
+      const urls = [it.url, ...(it.fallbacks || []), it.thumb].filter((u) => !!u && !tried.has(u) && tried.add(u));
+      const isOkayBlob = (b) => {
+        if (!(b instanceof Blob) || b.size <= 0) return false;
+        const t = (b.type || '').toLowerCase();
+        if (!t || t.startsWith('image/')) return true;
+        return !/^(text\/|application\/(json|xml|javascript|xhtml\+xml))/i.test(t);
+      };
+      let err = null;
+      for (const u of urls) {
         try {
-          const b = u.startsWith('data:') ? dataToBlob(u) : await gmGet(u, 'blob');
-          if (b.size > 0 && !/^text\//.test(b.type)) { it.finalUrl = u; return b; }
+          const b = u.startsWith('data:') ? dataToBlob(u) : await gmGet(u, 'blob', IMG_TIMEOUT_MS);
+          if (isOkayBlob(b)) { it.finalUrl = u; return b; }
+          err = new Error(`Unexpected content type${b.type ? ' ' + b.type : ''} from ${u}`);
         } catch (e) { err = e; }
       }
-      throw err || new Error('download failed');
+      throw err || new Error('Download failed: no usable image URL succeeded.');
     })();
     return it.blobP;
   }
@@ -144,10 +161,14 @@
 
     if (hostIs(location.hostname, 'pinterest.com') || hostIs(u.hostname, 'pinimg.com')) {
       const re = /pinimg\.com\/(?:\d+x\d*(?:_[A-Za-z0-9]+)?)\//;
-      if (re.test(it.url)) {
-        it.thumb = it.url;
-        it.fallbacks = [it.url.replace(re, 'pinimg.com/736x/'), it.url];
-        it.url = it.url.replace(re, 'pinimg.com/originals/');
+      const visibleThumb = (it.el && (it.el.currentSrc || it.el.src)) || it.url;
+      if (re.test(it.url) || /pinimg\.com\/originals\//.test(it.url)) {
+        const from = re.test(it.url) ? it.url : visibleThumb;
+        const as736 = from.replace(re, 'pinimg.com/736x/').replace(/pinimg\.com\/originals\//, 'pinimg.com/736x/');
+        const asOriginal = it.url.replace(re, 'pinimg.com/originals/');
+        it.thumb = visibleThumb;
+        it.fallbacks = [...new Set([as736, visibleThumb].filter(Boolean))];
+        it.url = asOriginal;
       }
       const pin = it.el && closestDeep(it.el, 'a[href*="/pin/"]');
       it.hint.via = (pin && pin.href) || (location.pathname.startsWith('/pin/') ? location.href : '');
@@ -640,6 +661,7 @@
 
   let known = new Set();
   let loading = false, exhausted = false, emptyTries = 0;
+  let pageScroller = null, retryTimer = 0;
 
   function addCard(it) {
     const shown = it.thumb || it.url;
@@ -676,18 +698,67 @@
     return added;
   }
 
-  // Scroll the real page to the bottom so it loads more photos
-  function scrollPageToEnd() {
+  function pageScrollShouldStayEnabled() {
+    return isGoogleImages() || hostIs(location.hostname, 'pinterest.com') || hostIs(location.hostname, 'pinimg.com');
+  }
+
+  function findPageScroller() {
+    if (pageScroller && pageScroller.isConnected) return pageScroller;
     const se = document.scrollingElement || document.documentElement;
-    se.scrollTo({ top: se.scrollHeight });
-    // some sites scroll an inner container instead of the window
-    let best = null;
-    for (const el of document.body.querySelectorAll('*')) {
-      if (el.scrollHeight > el.clientHeight + 200 && /(auto|scroll)/.test(getComputedStyle(el).overflowY)) {
-        if (!best || el.clientHeight * el.clientWidth > best.clientHeight * best.clientWidth) best = el;
-      }
+    const candidates = [];
+    const add = (el, bonus = 0) => {
+      if (!el || candidates.some((c) => c.el === el)) return;
+      const cs = getComputedStyle(el);
+      if (el !== se && (el.scrollHeight <= el.clientHeight + 200 || !/(auto|scroll)/.test(cs.overflowY))) return;
+      const area = Math.max(1, el.clientHeight * el.clientWidth);
+      candidates.push({ el, score: area + bonus });
+    };
+
+    add(se, 500);
+    if (isGoogleImages()) {
+      add(document.querySelector('#islmp'), 1500);
+      add(document.querySelector('[role="main"]'), 600);
     }
-    if (best && best !== se && best !== document.body) best.scrollTop = best.scrollHeight;
+    if (hostIs(location.hostname, 'pinterest.com')) {
+      add(document.querySelector('[data-test-id="fullPageScrollContainer"]'), 2000);
+      add(document.querySelector('[role="main"]'), 900);
+    }
+    for (const el of document.body.querySelectorAll('main,section,div,[role="main"]')) add(el, 0);
+    pageScroller = (candidates.sort((a, b) => b.score - a.score)[0] || { el: se }).el;
+    return pageScroller;
+  }
+
+  // Scroll the real page so it loads more photos
+  function scrollPageToEnd() {
+    const scroller = findPageScroller();
+    const top = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (scroller === document.body || scroller === document.documentElement || scroller === document.scrollingElement) {
+      window.scrollTo({ top, behavior: 'auto' });
+    } else {
+      scroller.scrollTop = top;
+    }
+    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+    window.dispatchEvent(new Event('scroll'));
+  }
+
+  function scheduleLoadMore(delayMs = 900) {
+    if (retryTimer || loading || ov.hidden || exhausted || items.length >= 2000) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = 0;
+      loadMore(false);
+    }, delayMs);
+  }
+
+  async function waitForResults(maxMs = 2200) {
+    const start = performance.now();
+    let totalAdded = 0;
+    while (performance.now() - start < maxMs) {
+      await new Promise((r) => setTimeout(r, 250));
+      const added = refreshItems();
+      totalAdded += added;
+      if (added) break;
+    }
+    return totalAdded;
   }
 
   // Click a "Show more results" style button if the page has one
@@ -702,15 +773,17 @@
 
   async function loadMore(manual) {
     if (loading || ov.hidden) return;
-    if (manual) { exhausted = false; emptyTries = 0; }
+    if (manual) {
+      exhausted = false; emptyTries = 0;
+      if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
+    }
     if (exhausted) return;
     loading = true;
     $('#more').disabled = true;
     setStatus(`Loading more photos from the page… (${items.length} so far)`);
     scrollPageToEnd();
     clickShowMore();
-    await new Promise((r) => setTimeout(r, 1600));
-    const added = refreshItems();
+    const added = await waitForResults();
     loading = false;
     $('#more').disabled = false;
     if (added) {
@@ -722,16 +795,23 @@
     }
     // Keep going if nothing new arrived yet, or the panel is too short to scroll
     const tooShort = grid.scrollHeight <= grid.clientHeight + 200;
-    if (!exhausted && !ov.hidden && items.length < 2000 && (!added || tooShort)) loadMore();
+    if (!exhausted && !ov.hidden && items.length < 2000 && (!added || tooShort)) scheduleLoadMore(950);
   }
 
   function openPanel(preselect) {
     items = []; known = new Set(); exhausted = false; emptyTries = 0; loading = false;
+    pageScroller = null;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
     grid.innerHTML = '';
     refreshItems();
     if (ov.hidden) {
-      prevOverflow = document.documentElement.style.overflow;
-      document.documentElement.style.overflow = 'hidden';
+      lockPageScroll = !pageScrollShouldStayEnabled();
+      if (lockPageScroll) {
+        prevOverflow = document.documentElement.style.overflow;
+        prevBodyOverflow = document.body.style.overflow;
+        document.documentElement.style.overflow = 'hidden';
+        document.body.style.overflow = 'hidden';
+      }
     }
     ov.hidden = false;
     $('#fab').hidden = true;
@@ -748,8 +828,15 @@
   }
 
   let prevOverflow = '';
+  let prevBodyOverflow = '';
+  let lockPageScroll = false;
   function closePanel() {
-    if (!ov.hidden) document.documentElement.style.overflow = prevOverflow;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
+    if (!ov.hidden && lockPageScroll) {
+      document.documentElement.style.overflow = prevOverflow;
+      document.body.style.overflow = prevBodyOverflow;
+      lockPageScroll = false;
+    }
     ov.hidden = true;
     $('#fab').hidden = false;
   }
@@ -763,31 +850,53 @@
     const date = new Date().toISOString().slice(0, 10);
     const folder = `photos-${location.hostname.replace(/^www\./, '')}-${date}`;
     const enc = new TextEncoder();
-    const used = new Set(), failed = [], all = [], zipFiles = [];
+    const used = new Set(), all = [], zipFiles = [];
+    const failedByIndex = new Array(sel.length);
+    const ready = new Array(sel.length);
     $('#dl').disabled = true;
-    for (const [n, it] of sel.entries()) {
-      setStatus(`${asZip ? 'Fetching' : 'Downloading'} ${n + 1} of ${sel.length}…`);
-      try {
-        const M0 = await resolve(it);
-        const blob = await fetchBlob(it);
-        const M = { ...M0, notes: [...M0.notes], imageUrl: it.finalUrl.startsWith('data:') ? `(inline thumbnail from ${M0.sourceUrl})` : it.finalUrl };
-        if (it.finalUrl !== it.url) M.notes.push('The full-size image could not be downloaded, so this is the smaller version shown on the page.');
-        const base = trunc(safe(M.title), 80) || 'photo';
-        let name = base, k = 2;
-        while (used.has(name)) name = `${base}-${k++}`;
-        used.add(name);
-        const imgName = `${name}.${extOf(blob, it.finalUrl)}`;
-        const txt = sidecar(M, style);
-        if (asZip) {
-          zipFiles.push({ name: `${folder}/${imgName}`, data: new Uint8Array(await blob.arrayBuffer()) });
-          zipFiles.push({ name: `${folder}/${name}.txt`, data: enc.encode(txt) });
-        } else {
-          await save(blob, imgName);
-          await save(new Blob([txt], { type: 'text/plain' }), `${name}.txt`);
+    let done = 0;
+    let next = 0;
+    const workers = Array.from({ length: Math.min(DL_CONCURRENCY, sel.length) }, async () => {
+      while (true) {
+        const i = next++;
+        if (i >= sel.length) return;
+        const it = sel[i];
+        try {
+          const M0 = await resolve(it);
+          const blob = await fetchBlob(it);
+          ready[i] = { it, M0, blob };
+        } catch (e) {
+          failedByIndex[i] = `${baseName(it.url)} (${e.message})`;
+        } finally {
+          done++;
+          setStatus(`${asZip ? 'Fetching' : 'Preparing'} ${done} of ${sel.length}…`);
         }
-        all.push({ file: imgName, citation: citation(M, style), issues: issues(M) });
-      } catch (e) { failed.push(`${baseName(it.url)} (${e.message})`); }
+      }
+    });
+    await Promise.all(workers);
+
+    for (const row of ready) {
+      if (!row) continue;
+      const { it, M0, blob } = row;
+      const finalUrl = it.finalUrl || it.url;
+      const M = { ...M0, notes: [...M0.notes], imageUrl: finalUrl.startsWith('data:') ? `(inline thumbnail from ${M0.sourceUrl})` : finalUrl };
+      if (finalUrl !== it.url) M.notes.push('The full-size image could not be downloaded, so this is the smaller version shown on the page.');
+      const base = trunc(safe(M.title), 80) || 'photo';
+      let name = base, k = 2;
+      while (used.has(name)) name = `${base}-${k++}`;
+      used.add(name);
+      const imgName = `${name}.${extOf(blob, finalUrl)}`;
+      const txt = sidecar(M, style);
+      if (asZip) {
+        zipFiles.push({ name: `${folder}/${imgName}`, data: new Uint8Array(await blob.arrayBuffer()) });
+        zipFiles.push({ name: `${folder}/${name}.txt`, data: enc.encode(txt) });
+      } else {
+        await save(blob, imgName);
+        await save(new Blob([txt], { type: 'text/plain' }), `${name}.txt`);
+      }
+      all.push({ file: imgName, citation: citation(M, style), issues: issues(M) });
     }
+    const failed = failedByIndex.filter(Boolean);
     if (all.length && (asZip || sel.length > 1)) {
       const flagged = all.filter((a) => a.issues.length);
       const combined =
